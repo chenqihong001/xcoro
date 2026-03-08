@@ -1,5 +1,6 @@
 #pragma once
 #include "awaitable_traits.hpp"
+#include "cancellation.hpp"
 #include "concepts/awaitable.hpp"
 #include "utils/void_value.hpp"
 #include <atomic>
@@ -352,6 +353,23 @@ when_all_task<R> make_when_all_task(Awaitable &&awaitable) {
   }
 }
 
+template <concepts::Awaitable Awaitable,
+          typename R = awaiter_result_t<Awaitable>>
+when_all_task<R> make_when_all_task_cancel_on_failure(Awaitable &&awaitable,
+                                                      cancellation_source &source) {
+  try {
+    if constexpr (std::is_void_v<R>) {
+      co_await std::forward<Awaitable>(awaitable);
+      co_return;
+    } else {
+      co_return co_await std::forward<Awaitable>(awaitable);
+    }
+  } catch (...) {
+    source.request_cancellation();
+    throw;
+  }
+}
+
 } // namespace detail
 
 template <concepts::Awaitable... Awaitables>
@@ -360,6 +378,15 @@ template <concepts::Awaitable... Awaitables>
       std::tuple<detail::when_all_task<awaiter_result_t<Awaitables>>...>>(
       std::make_tuple(
           detail::make_when_all_task(std::forward<Awaitables>(awaitables))...));
+}
+
+template <concepts::Awaitable... Awaitables>
+[[nodiscard]] auto when_all(cancellation_source &source,
+                            Awaitables &&...awaitables) {
+  return detail::when_all_ready_awaitable<
+      std::tuple<detail::when_all_task<awaiter_result_t<Awaitables>>...>>(
+      std::make_tuple(detail::make_when_all_task_cancel_on_failure(
+                          std::forward<Awaitables>(awaitables), source)...));
 }
 
 } // namespace xcoro
