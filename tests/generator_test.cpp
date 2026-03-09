@@ -51,7 +51,7 @@ TEST(GeneratorTest, FibonacciSeq) {
 }
 
 // 异常抛出测试
-TEST(Generator, ExceptionHandling) {
+TEST(GeneratorTest, ExceptionHandling) {
   auto throw_gen = []() -> generator<int> {
     co_yield 1;
     co_yield 2;
@@ -67,7 +67,7 @@ TEST(Generator, ExceptionHandling) {
 }
 
 // 引用语义测试
-TEST(Generator, ReferenceSemantic) {
+TEST(GeneratorTest, ReferenceSemantic) {
   std::vector<int> source = {1, 2, 3, 4};
   auto ref_gen = [&source]() -> generator<int&> {
     for (int& val : source) {

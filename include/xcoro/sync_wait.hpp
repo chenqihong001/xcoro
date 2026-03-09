@@ -1,7 +1,4 @@
 #pragma once
-#include "awaitable_traits.hpp"
-#include "concepts/awaitable.hpp"
-#include "utils/nocopyable.hpp"
 #include <atomic>
 #include <condition_variable>
 #include <coroutine>
@@ -11,12 +8,16 @@
 #include <utility>
 #include <variant>
 
+#include "awaitable.hpp"
+#include "awaitable_traits.hpp"
+#include "nocopyable.hpp"
+
 namespace xcoro {
 
 namespace detail {
 
 class sync_wait_event : public nocopyable {
-public:
+ public:
   sync_wait_event(bool initially_set = false) : is_set_(initially_set) {}
   ~sync_wait_event() = default;
 
@@ -32,16 +33,18 @@ public:
     cv_.wait(lock, [this]() { return is_set_.load(); });
   }
 
-private:
+ private:
   std::mutex mtx_;
   std::condition_variable cv_;
   std::atomic_bool is_set_ = false;
 };
 
-template <typename T> class sync_wait_task;
+template <typename T>
+class sync_wait_task;
 
-template <typename T> class sync_wait_task_promise final : public nocopyable {
-public:
+template <typename T>
+class sync_wait_task_promise final : public nocopyable {
+ public:
   sync_wait_task_promise() = default;
   ~sync_wait_task_promise() = default;
   using coroutine_handle = std::coroutine_handle<sync_wait_task_promise>;
@@ -55,12 +58,11 @@ public:
     result_.template emplace<std::exception_ptr>(std::current_exception());
   }
   template <typename U>
-    requires std::is_constructible_v<T, U &&>
-  void return_value(U &&value) noexcept {
+    requires std::is_constructible_v<T, U&&>
+  void return_value(U&& value) noexcept {
     if constexpr (std::is_reference_v<T>) {
       result_.template emplace<value_type>(std::addressof(value));
     } else {
-
       result_.template emplace<T>(std::forward<U>(value));
     }
   }
@@ -91,15 +93,16 @@ public:
       throw std::runtime_error("Task result not ready");
     }
   }
-  void set_event(sync_wait_event *event) noexcept { event_ = event; }
+  void set_event(sync_wait_event* event) noexcept { event_ = event; }
 
-private:
+ private:
   std::variant<std::monostate, value_type, std::exception_ptr> result_;
-  sync_wait_event *event_ = nullptr;
+  sync_wait_event* event_ = nullptr;
 };
 
-template <> class sync_wait_task_promise<void> : public nocopyable {
-public:
+template <>
+class sync_wait_task_promise<void> : public nocopyable {
+ public:
   sync_wait_task_promise() = default;
   ~sync_wait_task_promise() = default;
   using coroutine_handle = std::coroutine_handle<sync_wait_task_promise>;
@@ -126,28 +129,29 @@ public:
     };
     return completion_notifier{};
   }
-  void set_event(sync_wait_event *event) noexcept { event_ = event; }
+  void set_event(sync_wait_event* event) noexcept { event_ = event; }
 
-private:
-  sync_wait_event *event_ = nullptr;
+ private:
+  sync_wait_event* event_ = nullptr;
   std::exception_ptr exception_;
 };
 
-template <typename T> class sync_wait_task : public nocopyable {
-public:
+template <typename T>
+class sync_wait_task : public nocopyable {
+ public:
   using promise_type = sync_wait_task_promise<T>;
   explicit sync_wait_task(std::coroutine_handle<promise_type> handle)
       : handle_(handle) {}
-  void start(sync_wait_event &event) {
+  void start(sync_wait_event& event) {
     handle_.promise().set_event(
-        &event); // 必须在resume之前设置event，否则在final_suspend中会访问空指针
+        &event);  // 必须在resume之前设置event，否则在final_suspend中会访问空指针
     std::coroutine_handle<promise_type>::from_promise(handle_.promise())
         .resume();
   }
-  promise_type &promise() & { return handle_.promise(); }
-  promise_type &&promise() && { return std::move(handle_.promise()); }
+  promise_type& promise() & { return handle_.promise(); }
+  promise_type&& promise() && { return std::move(handle_.promise()); }
 
-private:
+ private:
   std::coroutine_handle<promise_type> handle_;
 };
 
@@ -164,7 +168,7 @@ sync_wait_task_promise<void>::get_return_object() noexcept {
 }
 
 template <concepts::Awaitable T, typename R = awaiter_result_t<T>>
-static auto make_sync_wait_task(T &&awaitable) -> sync_wait_task<R> {
+static auto make_sync_wait_task(T&& awaitable) -> sync_wait_task<R> {
   if constexpr (std::is_void_v<R>) {
     co_await std::forward<T>(awaitable);
     co_return;
@@ -173,10 +177,10 @@ static auto make_sync_wait_task(T &&awaitable) -> sync_wait_task<R> {
   }
 }
 
-} // namespace detail
+}  // namespace detail
 
 template <concepts::Awaitable T, typename R = awaiter_result_t<T>>
-decltype(auto) sync_wait(T &&awaitable) {
+decltype(auto) sync_wait(T&& awaitable) {
   // sync_wait的职责是运行make_sync_wait_task协程，去执行awaitable，并收集结果，在任务未完成时，阻塞
   detail::sync_wait_event event;
   auto task = detail::make_sync_wait_task(std::forward<T>(awaitable));
@@ -191,4 +195,4 @@ decltype(auto) sync_wait(T &&awaitable) {
   }
 }
 
-} // namespace xcoro
+}  // namespace xcoro

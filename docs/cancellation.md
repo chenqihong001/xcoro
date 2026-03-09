@@ -145,18 +145,92 @@ struct awaiter {
 
 ---
 
-## 6. IO 场景的取消模型（xcoro 已有雏形）
+## 6. 网络 + 组合器的取消模型（对齐 Asio / cppcoro）
 
-`io_scheduler` 中当前模型是对的，关键点如下：
+这一节把 `io_scheduler`、`when_all`、`when_any` 放在一起讲，因为三者的核心都是同一件事：  
+**取消只发请求，完成路径和取消路径竞争“单次恢复权”。**
 
-1. `io_awaiter::await_suspend()` 时注册 epoll 监听
-2. token 被取消时：
-   - 标记 `cancelled_ = true`
-   - `epoll_ctl(..., EPOLL_CTL_DEL, ...)` 解除监听
-   - `resume_once()` 恢复等待协程
-3. `await_resume()` 抛 `operation_cancelled`
+### 6.1 网络 I/O：`io_awaiter` / `timer_awaiter`（贴近 Asio reactor-op）
 
-`resume_once()` 用 `completed_` 原子保证幂等恢复，这是 IO 路径里防双 resume 的核心。
+`io_scheduler` 里的 fd I/O（`async_read_*` / `async_write_*` / `async_accept` / `async_connect`）是经典的 reactor 循环：
+
+1. 先执行系统调用（`read/write/accept/connect`）。
+2. `EINTR` 继续重试。
+3. `EAGAIN/EWOULDBLOCK` 时 `co_await io_awaiter{..., token}` 挂起等待可读/可写。
+4. 每轮循环都在进入阻塞点前 `throw_if_cancellation_requested(token)`。
+
+`io_awaiter::await_suspend()` 的关键步骤（与 Asio 的 reactor operation 很接近）：
+
+1. 保存 `handle_`，先做一次“立即取消”检查；若已取消则标记 `cancelled_` 并进入恢复路径。
+2. 用 `epoll_ctl(ADD/MOD)` 注册 `EPOLLONESHOT` 事件。
+3. 若 token 可取消，注册 `cancellation_registration` 回调：
+   - `cancelled_ = true`
+   - `epoll_ctl(..., EPOLL_CTL_DEL, ...)` 删除监听
+   - `resume_once()` + `scheduler_->wake()`
+4. `epoll_ctl` 失败则记录 `error_` 并走同一恢复路径。
+
+`on_event()`、取消回调、错误路径最终都汇聚到 `resume_once()`；  
+`resume_once()` 用 `completed_` 原子位保证“只入 ready 队列一次”，等价于 Asio 的“completion handler 只完成一次”约束。
+
+`await_resume()` 统一出结果：
+
+- `cancelled_ == true` -> 抛 `operation_cancelled`
+- `error_ != 0` -> 抛 `std::system_error`
+
+`timer_awaiter` 也是同一个模型，只是把 epoll 事件换成 `timer_state + 小根堆`：
+
+- 取消时标记 `state_->cancelled = true`，然后 `resume_once()`
+- `await_resume()` 看到 `cancelled` 就抛 `operation_cancelled`
+
+和 Asio 的对应关系可以这样理解：
+
+- 一致点：取消是协作式；操作最终会“以取消完成”并在安全点恢复协程。
+- 当前差异：还没有 Asio 那种细粒度 cancellation type（terminal/partial/total）和 per-op slot 语义，当前是单一 cancel bit。
+
+### 6.2 `when_all`：贴近 cppcoro `when_all_ready` 的“全部完成后汇总”
+
+当前 `when_all` 的结构与 cppcoro 的经典实现非常接近：
+
+1. 每个子 awaitable 被包装成 `when_all_task<R>`，各自 promise 存储“值或异常”。
+2. 父级 `when_all_ready_awaitable` 内部持有 `when_all_latch`。
+3. `try_await()` 启动所有子任务，父协程按计数器决定是否挂起。
+4. 子任务 `final_suspend()` 调用 `latch.notify_awaitable_completed()`；最后一个完成者恢复父协程。
+
+异常语义也贴近 cppcoro：
+
+- 子任务抛异常不会立刻打断 `when_all`，而是先存入对应 promise。
+- 父协程在 `await_resume()` 里统一 `rethrow_if_exception()`，再组装 tuple 结果。
+- 这意味着默认语义是“等全部结束，再在汇总点观测错误”。
+
+`when_all(cancellation_source&, ...)` 这个重载提供了 fail-fast 信号：
+
+- 每个子任务通过 `make_when_all_task_cancel_on_failure()` 包装。
+- 任一子任务抛异常时，先 `source.request_cancellation()`，再把异常继续抛出保存。
+
+注意它仍然是协作式而不是强中断：
+
+- 兄弟任务只有在共享 token 且命中取消点时才会尽快退出。
+- 没有检查 token 的任务仍会跑到自然完成；`when_all` 也会继续等它结束。
+
+### 6.3 `when_any`：贴近 Asio `operator||` 的 winner-takes-all
+
+当前 `when_any` 的实现是“首个完成者胜出”模型：
+
+1. 为每个子任务启动一个 `detached_task`。
+2. 所有任务共享 `first_completion_tracker`（内部 `atomic<bool> first_completed_`）。
+3. 只有第一个 `try_become_first()` 成功的任务可以写入结果/异常并 `notify_event.set()`。
+4. 父协程 `co_await notify` 后返回首个结果或重抛首个异常。
+
+`when_any(cancellation_source&, ...)` 的取消行为与 Asio `awaitable_operators::operator||` 非常接近：
+
+- 当 winner 产生（或首个异常产生）后，请求 `source.request_cancellation()`。
+- loser 任务收到取消请求后，在各自取消点退出。
+
+这里也有一个明确边界：
+
+- `source.request_cancellation()` 发生在 `when_any(...)` 返回/抛出之后。
+- 在请求发出到 loser 观察到 token 之间会有短暂窗口，因此 loser 可能再前进几步。
+- 想达到“尽快收敛”的体验，需要所有分支都统一接入同一个 token（尤其是 I/O awaiter 和定时等待）。
 
 ---
 
@@ -368,7 +442,10 @@ public:
       std::lock_guard<std::mutex> guard(mutex_);
       callbacks.swap(callbacks_);
     }
-
+    // 把回调列表在持锁期间“搬出去”，然后释放锁后再逐个调用
+    // - 保证回调只执行一次：callbacks_被清空（swap后为空），后续不会再被执行
+    // - 异常/noexcept友好：swap是noexcept，不会在request_cancellation()里抛异常
+    // - 降低临界区事件：只在swap时持锁，减少锁竞争
     for (auto& cb : callbacks) {
       cb->invoke();
     }
@@ -520,6 +597,7 @@ void cancellation_registration::register_callback(
     state_ = std::move(state);
     callback_ = std::move(cb_state);
   } else {
+  // 已经request cancellation了
     cb_state->invoke();
   }
 }

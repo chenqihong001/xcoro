@@ -19,6 +19,7 @@ enable_testing()
 
 set(TEST_FILES
  "tests/generator_test.cpp"
+ "tests/cancellation_test.cpp"
 )
 add_executable(xcoro_test ${TEST_FILES})
 target_link_libraries(xcoro_test GTest::gtest_main Threads::Threads)

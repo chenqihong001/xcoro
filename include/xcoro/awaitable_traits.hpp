@@ -1,9 +1,11 @@
 #pragma once
-#include "concepts/awaitable.hpp"
 #include <utility>
+
+#include "awaitable.hpp"
 namespace xcoro {
 namespace detail {
-template <concepts::Awaitable T> auto get_awaiter_impl(T &&awaitable) {
+template <concepts::Awaitable T>
+auto get_awaiter_impl(T&& awaitable) {
   if constexpr (concepts::detail::HasMemberCoAwait<T>) {
     return std::forward<T>(awaitable).operator co_await();
   } else if constexpr (concepts::detail::HasGlobalCoAwait<T>) {
@@ -13,7 +15,7 @@ template <concepts::Awaitable T> auto get_awaiter_impl(T &&awaitable) {
   }
 }
 
-} // namespace detail
+}  // namespace detail
 
 template <concepts::Awaitable T>
 using awaiter_t = decltype(detail::get_awaiter_impl(std::declval<T>()));
@@ -21,4 +23,4 @@ using awaiter_t = decltype(detail::get_awaiter_impl(std::declval<T>()));
 template <typename T>
 using awaiter_result_t = decltype(std::declval<awaiter_t<T>>().await_resume());
 
-} // namespace xcoro
+}  // namespace xcoro
