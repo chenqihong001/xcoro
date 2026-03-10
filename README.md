@@ -145,6 +145,12 @@ class acceptor;
 
 struct resolve_options;
 - int family = AF_UNSPEC 未指定地址族
+- int socktype = SOCK_STREAM
+- int flags = AI_ADDRCONFIG 根据本地址网络配置返回地址，只返回本地系统配置支持的地址族
+
+class resolver;
+static std::vector<endpoint> resolve(std::string_view host,std::string_view service,resolve_options opt = {})
+static task<std::vector<endpoint>> async_resolve(io_context & ctx,std::string host,std::string service, resolve_options opt = {}, cancellation_token token = {})
 
 
 

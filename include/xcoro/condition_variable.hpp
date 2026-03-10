@@ -1,7 +1,4 @@
 #pragma once
-
-#include "xcoroutine/cancellation.hpp"
-#include "xcoroutine/sync/mutex.hpp"
 #include <atomic>
 #include <coroutine>
 #include <memory>
@@ -13,15 +10,15 @@
 namespace xcoro {
 
 class condition_variable {
-public:
+ public:
   condition_variable() = default;
-  condition_variable(const condition_variable &) = delete;
-  condition_variable &operator=(const condition_variable &) = delete;
+  condition_variable(const condition_variable&) = delete;
+  condition_variable& operator=(const condition_variable&) = delete;
 
-private:
+ private:
   struct waiter_state {
     std::coroutine_handle<> handle{};
-    mutex *mutex{};
+    mutex* mutex{};
     std::atomic<bool> resumed{false};
     std::atomic<bool> cancelled{false};
 
@@ -30,9 +27,9 @@ private:
     }
   };
 
-public:
+ public:
   struct awaiter {
-    awaiter(condition_variable &cv, mutex &m, cancellation_token token = {}) noexcept
+    awaiter(condition_variable& cv, mutex& m, cancellation_token token = {}) noexcept
         : cv_(cv), mutex_(m), token_(std::move(token)) {}
 
     bool await_ready() noexcept {
@@ -78,17 +75,17 @@ public:
       }
     }
 
-  private:
-    condition_variable &cv_;
-    mutex &mutex_;
+   private:
+    condition_variable& cv_;
+    mutex& mutex_;
     cancellation_token token_;
     cancellation_registration registration_;
     std::shared_ptr<waiter_state> state_;
     bool cancelled_immediate_{false};
   };
 
-  auto wait(mutex &m) noexcept { return awaiter{*this, m}; }
-  auto wait(mutex &m, cancellation_token token) noexcept {
+  auto wait(mutex& m) noexcept { return awaiter{*this, m}; }
+  auto wait(mutex& m, cancellation_token token) noexcept {
     return awaiter{*this, m, std::move(token)};
   }
 
@@ -124,15 +121,15 @@ public:
         to_resume.push_back(std::move(w));
       }
     }
-    for (auto &w : to_resume) {
+    for (auto& w : to_resume) {
       if (w && w->mutex) {
         w->mutex->lock_and_resume(w->handle);
       }
     }
   }
 
-private:
-  void enqueue_waiter(const std::shared_ptr<waiter_state> &w) {
+ private:
+  void enqueue_waiter(const std::shared_ptr<waiter_state>& w) {
     std::lock_guard<std::mutex> guard(mutex_);
     waiters_.push(w);
   }
@@ -141,4 +138,4 @@ private:
   std::queue<std::shared_ptr<waiter_state>> waiters_;
 };
 
-} // namespace xcoro
+}  // namespace xcoro

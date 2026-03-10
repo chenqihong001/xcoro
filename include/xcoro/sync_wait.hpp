@@ -10,13 +10,12 @@
 
 #include "awaitable.hpp"
 #include "awaitable_traits.hpp"
-#include "nocopyable.hpp"
 
 namespace xcoro {
 
 namespace detail {
 
-class sync_wait_event : public nocopyable {
+class sync_wait_event {
  public:
   sync_wait_event(bool initially_set = false) : is_set_(initially_set) {}
   ~sync_wait_event() = default;
@@ -43,7 +42,7 @@ template <typename T>
 class sync_wait_task;
 
 template <typename T>
-class sync_wait_task_promise final : public nocopyable {
+class sync_wait_task_promise final {
  public:
   sync_wait_task_promise() = default;
   ~sync_wait_task_promise() = default;
@@ -101,7 +100,7 @@ class sync_wait_task_promise final : public nocopyable {
 };
 
 template <>
-class sync_wait_task_promise<void> : public nocopyable {
+class sync_wait_task_promise<void> {
  public:
   sync_wait_task_promise() = default;
   ~sync_wait_task_promise() = default;
@@ -137,7 +136,7 @@ class sync_wait_task_promise<void> : public nocopyable {
 };
 
 template <typename T>
-class sync_wait_task : public nocopyable {
+class sync_wait_task {
  public:
   using promise_type = sync_wait_task_promise<T>;
   explicit sync_wait_task(std::coroutine_handle<promise_type> handle)

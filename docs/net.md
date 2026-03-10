@@ -5,7 +5,7 @@
 
 本文涉及的网络组件：
 
-- `io_context`（事件循环，当前代码对应 `io_scheduler`）
+- `io_context`（事件循环）
 - `endpoint` / `address`（地址与端点）
 - `socket`（统一连接态与流式 I/O，融合原 `tcp_stream`）
 - `acceptor`（替代 `tcp_acceptor` 命名）
@@ -71,15 +71,15 @@ task<> io_context::sleep_for(std::chrono::duration<Rep, Period> d, cancellation_
 3. 事件完成与取消完成竞争“单次恢复权”（`completed_` 原子位）。
 4. `await_resume()` 统一将取消转换为 `operation_cancelled`。
 
-这与当前 `io_scheduler::io_awaiter` / `timer_awaiter` 的实现一致，后续网络组件都复用同一语义。
+这与 `9.1` 里的 `io_awaiter` / `timer_awaiter` 机制一致，后续网络组件都复用同一语义。
 
 ---
 
 ## 4. 组件设计
 
-### 4.1 io_context（当前 `io_scheduler`）
+### 4.1 io_context（事件循环核心）
 
-建议把 `io_scheduler` 语义提升为 `io_context` 命名，保留别名兼容：
+`io_context` 直接承载 reactor 事件循环，不依赖旧的 `io_scheduler` 别名层：
 
 ```cpp
 namespace xcoro::net {
@@ -98,13 +98,21 @@ class io_context {
 
   template <class Rep, class Period>
   task<> sleep_for(std::chrono::duration<Rep, Period> d, cancellation_token token);
-};
+  
+  task<std::size_t> async_read_some(int fd, void* buffer, std::size_t count,
+                                    cancellation_token token = {});
+  task<std::size_t> async_read_exact(int fd, void* buffer, std::size_t count,
+                                     cancellation_token token = {});
+  task<std::size_t> async_write_all(int fd, const void* buffer, std::size_t count,
+                                    cancellation_token token = {});
 
-using io_scheduler = io_context; // 迁移期别名
+  task<> async_accept(int fd, cancellation_token token = {});
+  task<> async_connection(int fd, cancellation_token token = {});
+};
 } // namespace xcoro::net
 ```
 
-实现继续沿用 epoll + eventfd + ready queue + timer heap，不需要回调接口。
+实现使用 epoll + eventfd + ready queue + timer heap，不需要回调接口。
 完整实现见 `9.1`。
 
 ### 4.2 endpoint/address（值语义优先）
@@ -338,14 +346,14 @@ task<> run_server(io_context& ctx, uint16_t port, cancellation_token token) {
 - `tcp_acceptor` -> 重命名并简化为 `acceptor`。
 - `address`（多态 + `shared_ptr`）-> `endpoint` 值类型。
 - `buffer` / `ring_buffer` -> `byte_buffer` + `mutable_buffer` / `const_buffer`。
-- `io_scheduler` -> `io_context`（可保留 type alias 兼容）。
+- 事件循环统一收敛到 `io_context`，不再保留 `io_scheduler`。
 
 ---
 
 ## 8. 落地顺序建议
 
-1. 先做命名层兼容：`io_context` / `acceptor` 别名与包装。
-2. 合并 `tcp_stream` 到 `socket`，保持底层 `io_scheduler` 不变。
+1. 先落地 `io_context` 独立实现（epoll/eventfd/timer）。
+2. 合并 `tcp_stream` 到 `socket`，统一走 `io_context` fd 级接口。
 3. 引入 `endpoint` 值类型并逐步替换 `shared_ptr<address>`。
 4. 引入新 `byte_buffer`，旧 `buffer` 暂时保留兼容适配层。
 5. 最后清理旧 API（`tcp_*` 与模糊 read/write 别名）。
@@ -357,18 +365,610 @@ task<> run_server(io_context& ctx, uint16_t port, cancellation_token token) {
 这一节给的是完整参考实现片段（header-only 风格）。  
 你可以按这里的文件拆分写进项目，再按自己的命名细节调整。
 
-### 9.1 `io_context`（直接复用现有 `io_scheduler`）
+### 9.1 `io_context`（完整实现，独立 epoll 版）
 
 ```cpp
 // include/xcoro/net/io_context.hpp
 #pragma once
 
-#include "xcoro/net/io_scheduler.hpp"
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <array>
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <coroutine>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <memory>
+#include <mutex>
+#include <queue>
+#include <system_error>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include "xcoro/cancellation_registration.hpp"
+#include "xcoro/cancellation_token.hpp"
+#include "xcoro/task.hpp"
 
 namespace xcoro::net {
 
-// 现阶段先别名复用，避免维护两套 reactor 代码
-using io_context = io_scheduler;
+enum io_event {
+  READ = EPOLLIN,
+  WRITE = EPOLLOUT,
+  ERROR = EPOLLERR,
+  HANGUP = EPOLLHUP,
+  RD_HANGUP = EPOLLRDHUP,
+  ONESHOT = EPOLLONESHOT
+};
+
+class io_awaiter;
+class schedule_awaiter;
+class timer_awaiter;
+
+class io_context {
+ public:
+  io_context();
+  ~io_context();
+
+  io_context(const io_context&) = delete;
+  io_context& operator=(const io_context&) = delete;
+  io_context(io_context&&) = delete;
+  io_context& operator=(io_context&&) = delete;
+
+  void run();
+  void run_in_current_thread();
+  void stop();
+
+  task<> schedule();
+
+  task<std::size_t> async_read_some(int fd, void* buffer, std::size_t count);
+  task<std::size_t> async_read_some(int fd, void* buffer, std::size_t count,
+                                    cancellation_token token);
+
+  task<std::size_t> async_read_exact(int fd, void* buffer, std::size_t count);
+  task<std::size_t> async_read_exact(int fd, void* buffer, std::size_t count,
+                                     cancellation_token token);
+
+  task<std::size_t> async_write_all(int fd, const void* buffer, std::size_t count);
+  task<std::size_t> async_write_all(int fd, const void* buffer, std::size_t count,
+                                    cancellation_token token);
+
+  task<> async_accept(int fd, cancellation_token token = {});
+  task<> async_connection(int fd, cancellation_token token = {});
+
+  template <typename T>
+  void spawn(task<T> t);
+
+  template <typename Rep, typename Period>
+  task<> sleep_for(std::chrono::duration<Rep, Period> d);
+
+  template <typename Rep, typename Period>
+  task<> sleep_for(std::chrono::duration<Rep, Period> d, cancellation_token token);
+
+ private:
+  friend class io_awaiter;
+  friend class schedule_awaiter;
+  friend class timer_awaiter;
+
+  static constexpr std::uint64_t kWakeTag = 0xffffffffffffffffULL;
+
+  void enqueue_ready(std::coroutine_handle<> h) noexcept;
+  void wake() noexcept;
+  void event_loop();
+  void drain_ready();
+  void drain_timers();
+  int calc_timeout_ms() noexcept;
+
+  struct timer_state {
+    io_context* ctx{};
+    std::coroutine_handle<> handle{};
+    std::atomic<bool> completed{false};
+    std::atomic<bool> cancelled{false};
+
+    void resume_once() noexcept {
+      if (!completed.exchange(true, std::memory_order_acq_rel)) {
+        ctx->enqueue_ready(handle);
+      }
+    }
+  };
+
+  struct timer_item {
+    std::chrono::steady_clock::time_point deadline;
+    std::shared_ptr<timer_state> state;
+  };
+  struct timer_cmp {
+    bool operator()(const timer_item& a, const timer_item& b) const noexcept {
+      return a.deadline > b.deadline;
+    }
+  };
+
+  int epoll_fd_{-1};
+  int wake_fd_{-1};
+  std::jthread loop_thread_;
+  std::atomic<bool> stopped_{false};
+
+  std::mutex ready_mu_;
+  std::queue<std::coroutine_handle<>> ready_;
+
+  std::mutex timer_mu_;
+  std::priority_queue<timer_item, std::vector<timer_item>, timer_cmp> timers_;
+};
+
+class io_awaiter {
+ public:
+  io_awaiter(io_context* ctx, int fd, int events, cancellation_token token = {})
+      : ctx_(ctx), fd_(fd), events_(events), token_(std::move(token)) {}
+
+  bool await_ready() noexcept { return false; }
+  void await_suspend(std::coroutine_handle<> h) noexcept;
+  void await_resume();
+
+  void on_event(std::uint32_t) noexcept;
+
+ private:
+  void resume_once() noexcept;
+
+  io_context* ctx_{};
+  int fd_{-1};
+  int events_{0};
+  std::coroutine_handle<> handle_{};
+  int error_{0};
+  std::atomic<bool> completed_{false};
+  std::atomic<bool> cancelled_{false};
+  cancellation_token token_;
+  cancellation_registration reg_;
+};
+
+class schedule_awaiter {
+ public:
+  explicit schedule_awaiter(io_context* ctx) : ctx_(ctx) {}
+  bool await_ready() noexcept { return false; }
+  void await_suspend(std::coroutine_handle<> h) noexcept;
+  void await_resume() noexcept {}
+
+ private:
+  io_context* ctx_{};
+};
+
+class timer_awaiter {
+ public:
+  timer_awaiter(io_context* ctx,
+                std::chrono::steady_clock::time_point deadline,
+                cancellation_token token = {})
+      : ctx_(ctx), deadline_(deadline), token_(std::move(token)) {}
+
+  bool await_ready() noexcept { return false; }
+  void await_suspend(std::coroutine_handle<> h) noexcept;
+  void await_resume();
+
+ private:
+  io_context* ctx_{};
+  std::chrono::steady_clock::time_point deadline_;
+  cancellation_token token_;
+  cancellation_registration reg_;
+  std::shared_ptr<io_context::timer_state> state_;
+};
+
+namespace detail {
+struct detached_task {
+  struct promise_type {
+    detached_task get_return_object() noexcept {
+      return detached_task{std::coroutine_handle<promise_type>::from_promise(*this)};
+    }
+    std::suspend_never initial_suspend() noexcept { return {}; }
+    std::suspend_never final_suspend() noexcept { return {}; }
+    void return_void() noexcept {}
+    void unhandled_exception() noexcept { std::terminate(); }
+  };
+
+  explicit detached_task(std::coroutine_handle<promise_type> h) noexcept : h_(h) {}
+  detached_task(detached_task&& other) noexcept : h_(std::exchange(other.h_, {})) {}
+  detached_task& operator=(detached_task&& other) noexcept {
+    if (this != &other) {
+      h_ = std::exchange(other.h_, {});
+    }
+    return *this;
+  }
+  ~detached_task() = default;
+
+ private:
+  std::coroutine_handle<promise_type> h_{};
+};
+} // namespace detail
+
+inline io_context::io_context() {
+  epoll_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
+  if (epoll_fd_ == -1) {
+    throw std::system_error(errno, std::system_category(), "epoll_create1 failed");
+  }
+
+  wake_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  if (wake_fd_ == -1) {
+    throw std::system_error(errno, std::system_category(), "eventfd failed");
+  }
+
+  epoll_event ev{};
+  ev.events = EPOLLIN;
+  ev.data.u64 = kWakeTag;
+  if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, wake_fd_, &ev) == -1) {
+    throw std::system_error(errno, std::system_category(), "epoll_ctl add wake_fd failed");
+  }
+}
+
+inline io_context::~io_context() {
+  stop();
+  if (wake_fd_ != -1) {
+    ::close(wake_fd_);
+  }
+  if (epoll_fd_ != -1) {
+    ::close(epoll_fd_);
+  }
+}
+
+inline void io_context::run() {
+  if (loop_thread_.joinable()) {
+    return;
+  }
+  stopped_.store(false, std::memory_order_relaxed);
+  loop_thread_ = std::jthread([this](std::stop_token) { event_loop(); });
+}
+
+inline void io_context::run_in_current_thread() {
+  if (loop_thread_.joinable()) {
+    return;
+  }
+  stopped_.store(false, std::memory_order_relaxed);
+  event_loop();
+}
+
+inline void io_context::stop() {
+  if (stopped_.exchange(true)) {
+    return;
+  }
+  wake();
+  if (loop_thread_.joinable()) {
+    loop_thread_.join();
+  }
+}
+
+inline void io_context::wake() noexcept {
+  if (wake_fd_ == -1) {
+    return;
+  }
+  std::uint64_t one = 1;
+  (void)::write(wake_fd_, &one, sizeof(one));
+}
+
+inline void io_context::enqueue_ready(std::coroutine_handle<> h) noexcept {
+  std::lock_guard<std::mutex> lock(ready_mu_);
+  ready_.push(h);
+}
+
+inline int io_context::calc_timeout_ms() noexcept {
+  std::lock_guard<std::mutex> lock(timer_mu_);
+  if (timers_.empty()) {
+    return -1;
+  }
+  auto now = std::chrono::steady_clock::now();
+  auto deadline = timers_.top().deadline;
+  if (deadline <= now) {
+    return 0;
+  }
+  auto diff = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+  return static_cast<int>(diff.count());
+}
+
+inline void io_context::drain_timers() {
+  auto now = std::chrono::steady_clock::now();
+  std::vector<std::shared_ptr<timer_state>> due;
+
+  {
+    std::lock_guard<std::mutex> lock(timer_mu_);
+    while (!timers_.empty() && timers_.top().deadline <= now) {
+      due.push_back(timers_.top().state);
+      timers_.pop();
+    }
+  }
+
+  for (auto& s : due) {
+    if (s) {
+      s->resume_once();
+    }
+  }
+}
+
+inline void io_context::drain_ready() {
+  std::queue<std::coroutine_handle<>> q;
+  {
+    std::lock_guard<std::mutex> lock(ready_mu_);
+    std::swap(q, ready_);
+  }
+  while (!q.empty()) {
+    auto h = q.front();
+    q.pop();
+    if (h) {
+      h.resume();
+    }
+  }
+}
+
+inline void io_context::event_loop() {
+  constexpr int kMaxEvents = 64;
+  std::array<epoll_event, kMaxEvents> evs{};
+
+  while (!stopped_.load(std::memory_order_relaxed)) {
+    int n = ::epoll_wait(epoll_fd_, evs.data(), kMaxEvents, calc_timeout_ms());
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      break;
+    }
+
+    for (int i = 0; i < n; ++i) {
+      if (evs[i].data.u64 == kWakeTag) {
+        std::uint64_t buf = 0;
+        while (::read(wake_fd_, &buf, sizeof(buf)) > 0) {
+        }
+        continue;
+      }
+
+      auto* aw = reinterpret_cast<io_awaiter*>(evs[i].data.u64);
+      if (aw) {
+        aw->on_event(evs[i].events);
+      }
+    }
+
+    drain_timers();
+    drain_ready();
+  }
+
+  drain_timers();
+  drain_ready();
+  stopped_.store(true, std::memory_order_relaxed);
+}
+
+inline task<> io_context::schedule() {
+  co_await schedule_awaiter{this};
+}
+
+inline task<std::size_t> io_context::async_read_some(int fd, void* buffer, std::size_t count) {
+  co_return co_await async_read_some(fd, buffer, count, cancellation_token{});
+}
+
+inline task<std::size_t> io_context::async_read_exact(int fd, void* buffer, std::size_t count) {
+  co_return co_await async_read_exact(fd, buffer, count, cancellation_token{});
+}
+
+inline task<std::size_t> io_context::async_write_all(int fd, const void* buffer, std::size_t count) {
+  co_return co_await async_write_all(fd, buffer, count, cancellation_token{});
+}
+
+inline task<std::size_t> io_context::async_read_some(int fd, void* buffer, std::size_t count,
+                                                     cancellation_token token) {
+  if (count == 0) {
+    co_return 0;
+  }
+  auto* p = static_cast<std::byte*>(buffer);
+
+  for (;;) {
+    throw_if_cancellation_requested(token);
+    ssize_t n = ::read(fd, p, count);
+    if (n > 0) {
+      co_return static_cast<std::size_t>(n);
+    }
+    if (n == 0) {
+      co_return 0;
+    }
+    if (errno == EINTR) {
+      continue;
+    }
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      co_await io_awaiter{this, fd, io_event::READ, token};
+      continue;
+    }
+    throw std::system_error(errno, std::system_category(), "read failed");
+  }
+}
+
+inline task<std::size_t> io_context::async_read_exact(int fd, void* buffer, std::size_t count,
+                                                      cancellation_token token) {
+  if (count == 0) {
+    co_return 0;
+  }
+  auto* p = static_cast<std::byte*>(buffer);
+  std::size_t total = 0;
+
+  while (total < count) {
+    throw_if_cancellation_requested(token);
+    ssize_t n = ::read(fd, p + total, count - total);
+    if (n > 0) {
+      total += static_cast<std::size_t>(n);
+      continue;
+    }
+    if (n == 0) {
+      co_return total;
+    }
+    if (errno == EINTR) {
+      continue;
+    }
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      co_await io_awaiter{this, fd, io_event::READ, token};
+      continue;
+    }
+    throw std::system_error(errno, std::system_category(), "read failed");
+  }
+
+  co_return total;
+}
+
+inline task<std::size_t> io_context::async_write_all(int fd, const void* buffer, std::size_t count,
+                                                     cancellation_token token) {
+  if (count == 0) {
+    co_return 0;
+  }
+  auto* p = static_cast<const std::byte*>(buffer);
+  std::size_t written = 0;
+
+  while (written < count) {
+    throw_if_cancellation_requested(token);
+    ssize_t n = ::write(fd, p + written, count - written);
+    if (n > 0) {
+      written += static_cast<std::size_t>(n);
+      continue;
+    }
+    if (errno == EINTR) {
+      continue;
+    }
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      co_await io_awaiter{this, fd, io_event::WRITE, token};
+      continue;
+    }
+    throw std::system_error(errno, std::system_category(), "write failed");
+  }
+
+  co_return written;
+}
+
+inline task<> io_context::async_accept(int fd, cancellation_token token) {
+  co_await io_awaiter{this, fd, io_event::READ, token};
+}
+
+inline task<> io_context::async_connection(int fd, cancellation_token token) {
+  co_await io_awaiter{this, fd, io_event::WRITE, token};
+
+  int err = 0;
+  socklen_t len = sizeof(err);
+  if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == -1) {
+    throw std::system_error(errno, std::system_category(), "getsockopt SO_ERROR failed");
+  }
+  if (err != 0) {
+    throw std::system_error(err, std::system_category(), "connect failed");
+  }
+}
+
+template <typename T>
+inline void io_context::spawn(task<T> t) {
+  auto starter = [this](task<T> inner) -> detail::detached_task {
+    co_await schedule();
+    co_await std::move(inner);
+  };
+  (void)starter(std::move(t));
+}
+
+template <typename Rep, typename Period>
+inline task<> io_context::sleep_for(std::chrono::duration<Rep, Period> d) {
+  const auto deadline = std::chrono::steady_clock::now() + d;
+  co_await timer_awaiter{this, deadline};
+}
+
+template <typename Rep, typename Period>
+inline task<> io_context::sleep_for(std::chrono::duration<Rep, Period> d, cancellation_token token) {
+  const auto deadline = std::chrono::steady_clock::now() + d;
+  co_await timer_awaiter{this, deadline, token};
+}
+
+inline void io_awaiter::await_suspend(std::coroutine_handle<> h) noexcept {
+  handle_ = h;
+  if (token_.can_be_cancelled() && token_.is_cancellation_requested()) {
+    cancelled_.store(true, std::memory_order_release);
+    resume_once();
+    ctx_->wake();
+    return;
+  }
+
+  std::uint32_t ev = static_cast<std::uint32_t>(events_ | io_event::ONESHOT | io_event::RD_HANGUP);
+  epoll_event event{};
+  event.events = ev;
+  event.data.u64 = reinterpret_cast<std::uint64_t>(this);
+
+  if (::epoll_ctl(ctx_->epoll_fd_, EPOLL_CTL_MOD, fd_, &event) == -1) {
+    if (errno == ENOENT) {
+      if (::epoll_ctl(ctx_->epoll_fd_, EPOLL_CTL_ADD, fd_, &event) == -1) {
+        error_ = errno;
+      }
+    } else {
+      error_ = errno;
+    }
+  }
+
+  if (token_.can_be_cancelled()) {
+    reg_ = cancellation_registration(token_, [this]() noexcept {
+      cancelled_.store(true, std::memory_order_release);
+      ::epoll_ctl(ctx_->epoll_fd_, EPOLL_CTL_DEL, fd_, nullptr);
+      resume_once();
+      ctx_->wake();
+    });
+  }
+
+  if (error_ != 0) {
+    resume_once();
+    ctx_->wake();
+  }
+}
+
+inline void io_awaiter::await_resume() {
+  if (cancelled_.load(std::memory_order_acquire)) {
+    throw operation_cancelled{};
+  }
+  if (error_ != 0) {
+    throw std::system_error(error_, std::system_category(), "epoll_ctl failed");
+  }
+}
+
+inline void io_awaiter::on_event(std::uint32_t) noexcept {
+  resume_once();
+}
+
+inline void io_awaiter::resume_once() noexcept {
+  if (!completed_.exchange(true, std::memory_order_acq_rel)) {
+    ctx_->enqueue_ready(handle_);
+  }
+}
+
+inline void schedule_awaiter::await_suspend(std::coroutine_handle<> h) noexcept {
+  ctx_->enqueue_ready(h);
+  ctx_->wake();
+}
+
+inline void timer_awaiter::await_suspend(std::coroutine_handle<> h) noexcept {
+  state_ = std::make_shared<io_context::timer_state>();
+  state_->ctx = ctx_;
+  state_->handle = h;
+
+  if (token_.can_be_cancelled() && token_.is_cancellation_requested()) {
+    state_->cancelled.store(true, std::memory_order_release);
+    state_->resume_once();
+    ctx_->wake();
+    return;
+  }
+
+  if (token_.can_be_cancelled()) {
+    reg_ = cancellation_registration(token_, [state = state_, ctx = ctx_]() noexcept {
+      state->cancelled.store(true, std::memory_order_release);
+      state->resume_once();
+      ctx->wake();
+    });
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(ctx_->timer_mu_);
+    ctx_->timers_.push(io_context::timer_item{deadline_, state_});
+  }
+  ctx_->wake();
+}
+
+inline void timer_awaiter::await_resume() {
+  if (state_ && state_->cancelled.load(std::memory_order_acquire)) {
+    throw operation_cancelled{};
+  }
+}
 
 } // namespace xcoro::net
 ```
@@ -716,7 +1316,7 @@ class socket {
         continue;
       }
       if (errno == EINPROGRESS || errno == EALREADY) {
-        // 复用现有 io_scheduler 的 connect-completion 等待
+        // 等待 fd 可写并校验 SO_ERROR
         co_await ctx_->async_connection(fd_, token);
         co_return;
       }
