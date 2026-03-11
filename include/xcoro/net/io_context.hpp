@@ -39,6 +39,19 @@ enum io_event {
   ONESHOT = EPOLLONESHOT   // 事件触发后会自动从epoll中禁用该文件描述符
 };
 
+inline ssize_t write_no_sigpipe(int fd, const void* buffer, size_t count) {
+#ifdef MSG_NOSIGNAL
+  ssize_t n = ::send(fd, buffer, count, MSG_NOSIGNAL);
+  if (n >= 0) {
+    return n;
+  }
+  if (errno != ENOTSOCK) {
+    return -1;
+  }
+#endif
+  return ::write(fd, buffer, count);
+}
+
 class io_awaiter;
 class schedule_awaiter;
 class timer_awaiter;
@@ -179,6 +192,10 @@ struct detached_task {
     detached_task get_return_object() noexcept {
       return detached_task{std::coroutine_handle<promise_type>::from_promise(*this)};
     }
+    std::suspend_never initial_suspend() noexcept { return {}; }
+    std::suspend_never final_suspend() noexcept { return {}; }
+    void return_void() noexcept {}
+    void unhandled_exception() noexcept { std::terminate(); }
   };
   explicit detached_task(std::coroutine_handle<promise_type> h) noexcept : h_(h) {}
   detached_task(detached_task&& other) noexcept : h_(std::exchange(other.h_, {})) {}
@@ -410,7 +427,7 @@ inline task<size_t> io_context::async_write_all(int fd, const void* buffer, size
   size_t written = 0;
   while (written < count) {
     throw_if_cancellation_requested(token);
-    ssize_t n = ::write(fd, p + written, count - written);
+    ssize_t n = write_no_sigpipe(fd, p + written, count - written);
     if (n > 0) {
       written += static_cast<size_t>(n);
       continue;

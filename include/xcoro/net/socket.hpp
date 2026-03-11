@@ -32,6 +32,7 @@ class socket {
   }
   socket& operator=(socket&& other) noexcept {
     if (this != &other) {
+      close();
       ctx_ = other.ctx_;
       fd_ = other.fd_;
       other.ctx_ = nullptr;
@@ -92,14 +93,40 @@ class socket {
 };
 
 inline socket socket::open_tcp(io_context& ctx, int family) {
-  int fd = ::socket(family, SOCK_STREAM, IPPROTO_TCP);
+  int fd = ::socket(family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_TCP);
+  if (fd == -1 && (errno == EINVAL || errno == EPROTONOSUPPORT)) {
+    fd = ::socket(family, SOCK_STREAM, IPPROTO_TCP);
+    if (fd != -1) {
+      int flags = ::fcntl(fd, F_GETFL, 0);
+      if (flags != -1) {
+        (void)::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+      }
+      int fd_flags = ::fcntl(fd, F_GETFD, 0);
+      if (fd_flags != -1) {
+        (void)::fcntl(fd, F_SETFD, fd_flags | FD_CLOEXEC);
+      }
+    }
+  }
   if (fd == -1) {
     throw std::system_error(errno, std::system_category(), "socket(TCP) failed");
   }
   return socket{ctx, fd};
 }
 inline socket socket::open_udp(io_context& ctx, int family) {
-  int fd = ::socket(family, SOCK_DGRAM, IPPROTO_UDP);
+  int fd = ::socket(family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_UDP);
+  if (fd == -1 && (errno == EINVAL || errno == EPROTONOSUPPORT)) {
+    fd = ::socket(family, SOCK_DGRAM, IPPROTO_UDP);
+    if (fd != -1) {
+      int flags = ::fcntl(fd, F_GETFL, 0);
+      if (flags != -1) {
+        (void)::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+      }
+      int fd_flags = ::fcntl(fd, F_GETFD, 0);
+      if (fd_flags != -1) {
+        (void)::fcntl(fd, F_SETFD, fd_flags | FD_CLOEXEC);
+      }
+    }
+  }
   if (fd == -1) {
     throw std::system_error(errno, std::system_category(), "socket(UDP) failed");
   }
@@ -158,6 +185,9 @@ inline task<> socket::async_connect(const endpoint& ep, cancellation_token token
     if (r == 0) {
       co_return;
     }
+    if (errno == EISCONN) {
+      co_return;
+    }
     if (errno == EINTR) {
       continue;
     }
@@ -186,7 +216,7 @@ inline task<std::size_t> socket::async_write_some(const_buffer src, cancellation
 
   for (;;) {
     throw_if_cancellation_requested(token);
-    ssize_t n = ::write(fd_, src.bytes.data(), src.bytes.size());
+    ssize_t n = write_no_sigpipe(fd_, src.bytes.data(), src.bytes.size());
     if (n > 0) {
       co_return static_cast<std::size_t>(n);
     }
