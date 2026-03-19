@@ -25,6 +25,7 @@ set(TEST_FILES
  "tests/mutex_test.cpp"
  "tests/condition_variable_test.cpp"
  "tests/event_test.cpp"
+ "tests/thread_pool_test.cpp"
  "tests/when_any_test.cpp"
  "tests/when_all_test.cpp"
 )
