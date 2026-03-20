@@ -20,6 +20,7 @@
 #include "xcoro/net/detail/descriptor_state.hpp"
 #include "xcoro/net/detail/epoll_reactor.hpp"
 #include "xcoro/net/detail/io_context_access.hpp"
+#include "xcoro/net/detail/no_sigpipe.hpp"
 #include "xcoro/net/detail/timer_queue.hpp"
 #include "xcoro/task.hpp"
 
@@ -217,7 +218,8 @@ class io_context {
 
     while (written < count) {
       throw_if_cancellation_requested(token);
-      const ssize_t n = ::write(fd, out + written, count - written);
+      const ssize_t n =
+          detail::write_no_sigpipe(fd, out + written, count - written);
       if (n > 0) {
         written += static_cast<size_t>(n);
         continue;
@@ -492,16 +494,17 @@ class io_context {
 
     resume_due_timers();
     drain_ready();
+    // 退出前，完成所有ready工作
   }
 
-  detail::timer_queue timers_;
-  detail::epoll_reactor reactor_;
+  detail::timer_queue timers_;     // 保存所有定时器
+  detail::epoll_reactor reactor_;  // 负责和epoll/eventfd交互
 
-  std::mutex ready_mutex_;
-  std::queue<std::coroutine_handle<>> ready_;
+  std::mutex ready_mutex_;                     // 保护ready_队列
+  std::queue<std::coroutine_handle<>> ready_;  // 保存即将被恢复的协程句柄
 
-  std::jthread loop_thread_;
-  std::atomic_bool stopped_{false};
+  std::jthread loop_thread_;         // 后台事件循环线程，run()时启动
+  std::atomic_bool stopped_{false};  // 标志事件循环是否停止
 };
 
 }  // namespace xcoro::net

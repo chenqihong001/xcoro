@@ -14,6 +14,7 @@
 #include "xcoro/net/buffer.hpp"
 #include "xcoro/net/detail/descriptor_state.hpp"
 #include "xcoro/net/detail/fd_ops.hpp"
+#include "xcoro/net/detail/no_sigpipe.hpp"
 #include "xcoro/net/endpoint.hpp"
 #include "xcoro/net/io_context.hpp"
 
@@ -216,8 +217,9 @@ class socket {
 
     for (;;) {
       throw_if_cancellation_requested(token);
-      const ssize_t n = ::write(native_handle(), src.bytes.data(),
-                                src.bytes.size());
+      const ssize_t n =
+          detail::write_no_sigpipe(native_handle(), src.bytes.data(),
+                                   src.bytes.size());
       if (n > 0) {
         co_return static_cast<size_t>(n);
       }
@@ -245,8 +247,8 @@ class socket {
     while (written < src.bytes.size()) {
       throw_if_cancellation_requested(token);
       const ssize_t n =
-          ::write(native_handle(), src.bytes.data() + written,
-                  src.bytes.size() - written);
+          detail::write_no_sigpipe(native_handle(), src.bytes.data() + written,
+                                   src.bytes.size() - written);
       if (n > 0) {
         written += static_cast<size_t>(n);
         continue;
