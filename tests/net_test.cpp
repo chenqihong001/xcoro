@@ -1,4 +1,6 @@
+#include "xcoro/net/acceptor.hpp"
 #include "xcoro/net/io_context.hpp"
+#include "xcoro/net/resolver.hpp"
 #include "xcoro/net/socket.hpp"
 
 #include <gtest/gtest.h>
@@ -7,6 +9,7 @@
 #include <cerrno>
 #include <cstring>
 #include <future>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -255,4 +258,73 @@ TEST(NetTest, ByteBufferPrepareKeepsContiguousContract) {
   EXPECT_EQ(regions[0].size(), 5u);
   EXPECT_EQ(regions[1].size(), 0u);
   EXPECT_EQ(collect_bytes(buf), "fghij");
+}
+
+TEST(NetTest, AcceptorAcceptsIncomingConnection) {
+  io_context ctx;
+  std::optional<acceptor> listener;
+  try {
+    listener.emplace(acceptor::listen(ctx, endpoint::ipv4_any(0)));
+  } catch (const std::system_error& e) {
+    if (e.code().value() == EPERM || e.code().value() == EACCES ||
+        e.code().value() == EAFNOSUPPORT) {
+      GTEST_SKIP() << "listening sockets are not permitted in this environment";
+    }
+    throw;
+  }
+
+  std::optional<xcoro_socket> client;
+  try {
+    client.emplace(xcoro_socket::open_tcp(ctx));
+  } catch (const std::system_error& e) {
+    if (e.code().value() == EPERM || e.code().value() == EACCES ||
+        e.code().value() == EAFNOSUPPORT) {
+      GTEST_SKIP() << "client sockets are not permitted in this environment";
+    }
+    throw;
+  }
+
+  ctx.run();
+
+  const endpoint listen_ep = listener->native_socket().local_endpoint();
+  auto accepted_future = std::async(std::launch::async, [&] {
+    return sync_wait(listener->async_accept());
+  });
+
+  sync_wait(client->async_connect(listen_ep));
+  xcoro_socket accepted = accepted_future.get();
+
+  EXPECT_TRUE(client->is_open());
+  EXPECT_TRUE(accepted.is_open());
+  EXPECT_EQ(accepted.peer_endpoint().port(), client->local_endpoint().port());
+
+  ctx.stop();
+}
+
+TEST(NetTest, ResolverAsyncResolveNumericAddress) {
+  io_context ctx;
+  ctx.run();
+
+  const auto endpoints = sync_wait(
+      resolver::async_resolve(ctx, resolve_query{"127.0.0.1", "8080"}));
+
+  ctx.stop();
+
+  ASSERT_FALSE(endpoints.empty());
+  EXPECT_EQ(endpoints.front().port(), 8080);
+}
+
+TEST(NetTest, ResolverAsyncResolveHonorsPreCancelledToken) {
+  io_context ctx;
+  ctx.run();
+
+  cancellation_source source;
+  source.request_cancellation();
+
+  EXPECT_THROW(
+      sync_wait(resolver::async_resolve(
+          ctx, resolve_query{"127.0.0.1", "8080"}, source.token())),
+      operation_cancelled);
+
+  ctx.stop();
 }
