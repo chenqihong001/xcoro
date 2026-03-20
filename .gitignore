@@ -3,3 +3,5 @@ out/
 .cache
 main.cpp
 .claude
+net.md
+thread_pool.md

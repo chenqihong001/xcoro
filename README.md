@@ -1,53 +1,128 @@
 # xcoro
 
-`xcoro` 是一个基于 C++20 协程的轻量协程库，设计方向参考了 `cppcoro` / `libcoro`：  
-提供可组合的 awaitable 抽象、同步原语、取消机制和基础网络 I/O 能力。
+`xcoro` 是一个基于 C++20 协程的轻量头文件库，提供：
 
-当前仓库以“头文件实现 + 测试驱动”方式维护，适合学习协程模型与构建中小型异步组件。
+- 基础协程类型：`task<T>`、`generator<T>`
+- 组合原语：`sync_wait`、`when_all`、`when_any`
+- 取消模型：`cancellation_source`、`cancellation_token`、`operation_cancelled`
+- 同步原语：`manual_reset_event`、`semaphore`、`mutex`、`condition_variable`
+- 调度组件：`thread_pool`
+- Linux 网络 I/O：`net::io_context`、`socket`、`acceptor`、`resolver`
 
-## Overview
+它的目标不是做一个“大而全”的异步框架，而是提供一组结构清晰、容易组合、容易继续扩展的协程基础组件。
 
-已实现的核心能力：
+## 适合用来做什么
 
-- Coroutine types
-  - `task<T>`
-  - `generator<T>`
-- Composition
-  - `sync_wait(awaitable)`
-  - `when_all(awaitables...)`
-  - `when_any(awaitables...)`
-  - `when_any(range)`
-- Cancellation
-  - `cancellation_source`
-  - `cancellation_token`
-  - `cancellation_registration`
-  - `operation_cancelled`
-- Synchronization primitives
-  - `manual_reset_event` / `event`
-  - `counting_semaphore` / `semaphore` / `binary_semaphore`
-  - `mutex`
-  - `condition_variable`
-  - `latch`
-- Networking (Linux)
-  - `net::io_context` (epoll + eventfd)
-  - `net::socket`
-  - `net::acceptor`
-  - `net::resolver`
-  - `net::endpoint`
-  - `net::byte_buffer`, `mutable_buffer`, `const_buffer`
-- Scheduler-like utility
-  - `thread_pool`（实验接口）
+如果你的项目需要下面这些能力，`xcoro` 比较适合：
 
-## Requirements
+- 用 `task<T>` 把异步逻辑写成顺序代码
+- 在多个协程之间做并发等待和结果聚合
+- 给等待操作增加取消能力
+- 在不引入大型运行时的前提下使用基础同步原语
+- 在 Linux 上用 `epoll + eventfd` 跑简单网络协程
+- 用一个轻量线程池把协程切到后台线程执行
 
-- C++20 编译器（建议 `GCC 13+` 或同等级 Clang）
-- CMake（仓库当前测试配置使用 `3.10+`）
-- Linux（网络模块依赖 `epoll/eventfd`）
-- `pthread`（编译/链接时建议加 `-pthread`）
+## 环境要求
 
-## Quick Start
+- C++20 编译器
+  建议 `GCC 13+` 或同等级 `Clang`
+- CMake `3.16+`
+- `pthread`
+- Linux
+  `net` 模块依赖 `epoll` / `eventfd`
 
-### 1) 最小示例：`task + sync_wait`
+说明：
+
+- 非网络模块基本都是头文件实现
+- `net` 模块当前明确按 Linux 语义设计
+- `thread_pool` 已可使用，但仍建议视为实验接口
+
+## 接入库
+
+当前仓库已经导出标准的 header-only CMake target：
+
+- package name: `xcoro`
+- target name: `xcoro::xcoro`
+
+推荐始终通过 `target_link_libraries(... xcoro::xcoro)` 来接入。  
+这样 C++20、头文件目录和 `Threads::Threads` 依赖都会自动带上。
+
+### 方式 1：安装后使用 `find_package`
+
+先在 `xcoro` 仓库根目录安装：
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DXCORO_BUILD_TESTS=OFF
+cmake --build build --parallel
+cmake --install build --prefix /path/to/xcoro-install
+```
+
+然后在你的项目里这样写：
+
+```cmake
+find_package(xcoro CONFIG REQUIRED)
+
+add_executable(app main.cpp)
+target_link_libraries(app PRIVATE xcoro::xcoro)
+```
+
+配置你的项目时，把安装前缀传给 CMake：
+
+```bash
+cmake -S . -B build -DCMAKE_PREFIX_PATH=/path/to/xcoro-install
+```
+
+### 方式 2：通过 `FetchContent` 直接拉源码
+
+```cmake
+include(FetchContent)
+
+set(XCORO_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+
+FetchContent_Declare(
+  xcoro
+  GIT_REPOSITORY https://github.com/<your-org>/xcoro.git
+  GIT_TAG main
+)
+
+FetchContent_MakeAvailable(xcoro)
+
+add_executable(app main.cpp)
+target_link_libraries(app PRIVATE xcoro::xcoro)
+```
+
+建议：
+
+- 如果你是正式项目，最好把 `GIT_TAG` 固定为具体 tag 或 commit
+- 如果你只是本地联调，先跟 `main` 也可以
+
+### 方式 3：作为子目录引入
+
+```cmake
+set(XCORO_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+add_subdirectory(external/xcoro)
+
+add_executable(app main.cpp)
+target_link_libraries(app PRIVATE xcoro::xcoro)
+```
+
+### 方式 4：不使用 CMake，直接包含头文件
+
+如果你只是快速试验，也可以直接手工编译：
+
+```bash
+g++ -std=c++20 -O2 -pthread -I./include demo.cpp -o demo
+./demo
+```
+
+这种方式最直接，但不适合长期维护。  
+一旦项目规模上来，还是推荐用 `xcoro::xcoro` 这个 target。
+
+## 第一个程序
+
+### 1. `task + sync_wait`
+
+这是最基础的使用方式：定义一个返回 `task<T>` 的协程，然后用 `sync_wait()` 在当前线程里等待结果。
 
 ```cpp
 #include <iostream>
@@ -60,23 +135,25 @@ xcoro::task<int> twice(int x) {
 }
 
 int main() {
-  int v = xcoro::sync_wait(twice(21));
-  std::cout << v << "\n";  // 42
+  const int value = xcoro::sync_wait(twice(21));
+  std::cout << value << "\n";
+  return 0;
 }
 ```
 
-本地直接编译（仓库根目录）：
+适合场景：
 
-```bash
-g++ -std=c++20 -O2 -pthread -I./include demo.cpp -o demo
-./demo
-```
+- 写最小示例
+- 在同步 `main()` 里等待一个协程结果
+- 给已有同步代码逐步引入协程
 
-### 2) `when_all`: 并发等待多个任务
+### 2. 并发等待多个任务：`when_all`
+
+`when_all()` 会等待所有 awaitable 完成，并返回聚合结果。
 
 ```cpp
-#include <tuple>
 #include <string>
+#include <tuple>
 
 #include "xcoro/sync_wait.hpp"
 #include "xcoro/task.hpp"
@@ -87,16 +164,20 @@ xcoro::task<std::string> second() { co_return "ok"; }
 
 int main() {
   auto result = xcoro::sync_wait(xcoro::when_all(first(), second()));
-  // result 是 std::tuple<int, std::string>
   return (std::get<0>(result) == 3 && std::get<1>(result) == "ok") ? 0 : 1;
 }
 ```
 
-### 3) `when_any`: 获取最先完成的任务
+适合场景：
+
+- 并发发起多个协程，再统一收结果
+- 等一组操作全部完成后再继续
+
+### 3. 等最先完成的任务：`when_any`
+
+`when_any()` 会在第一个 awaitable 完成时返回。
 
 ```cpp
-#include <vector>
-
 #include "xcoro/manual_reset_event.hpp"
 #include "xcoro/sync_wait.hpp"
 #include "xcoro/task.hpp"
@@ -114,15 +195,17 @@ xcoro::task<int> slow(xcoro::manual_reset_event& gate) {
 int main() {
   xcoro::manual_reset_event gate;
   auto result = xcoro::sync_wait(xcoro::when_any(fast(), slow(gate)));
-  // variadic 版本：result.active_index() + result.get<Index>()
   return (result.active_index() == 0 && result.get<0>() == 7) ? 0 : 1;
 }
 ```
 
-## Cancellation
+适合场景：
 
-取消模型与 `cppcoro/libcoro` 常见设计一致：`source` 发起取消，`token` 传播取消状态，  
-await 点可抛 `operation_cancelled`。
+- 超时竞争
+- 多路请求抢最快结果
+- “谁先完成就先用谁”的聚合逻辑
+
+### 4. 取消等待：`cancellation_token`
 
 ```cpp
 #include "xcoro/cancellation_source.hpp"
@@ -130,42 +213,91 @@ await 点可抛 `operation_cancelled`。
 #include "xcoro/sync_wait.hpp"
 #include "xcoro/task.hpp"
 
-xcoro::task<void> wait_or_cancel(xcoro::semaphore& sem, xcoro::cancellation_token token) {
-  co_await sem.acquire(token);  // 若 token 已取消/过程中取消，会抛 operation_cancelled
+xcoro::task<void> wait_or_cancel(
+    xcoro::semaphore& sem,
+    xcoro::cancellation_token token) {
+  co_await sem.acquire(token);
 }
 
 int main() {
   xcoro::semaphore sem(0);
   xcoro::cancellation_source source;
+
   try {
+    source.request_cancellation();
     xcoro::sync_wait(wait_or_cancel(sem, source.token()));
   } catch (const xcoro::operation_cancelled&) {
-    // cancelled
   }
 }
 ```
 
-## Networking (Linux)
+使用模式通常是：
 
-`net::io_context` 使用 `epoll + eventfd` 驱动 I/O，提供：
+1. 创建 `cancellation_source`
+2. 把 `source.token()` 传进协程
+3. 在外部调用 `request_cancellation()`
+4. 被取消的 await 点抛出 `operation_cancelled`
 
-- `schedule()`
-- `sleep_for(duration[, token])`
-- `async_read_some/read_exact`
-- `async_write_all`
-- `async_accept`
-- `async_connection`
+### 5. 把协程切到线程池：`thread_pool`
 
-典型使用流程：
+```cpp
+#include "xcoro/sync_wait.hpp"
+#include "xcoro/task.hpp"
+#include "xcoro/thread_pool.hpp"
+
+xcoro::task<int> compute(xcoro::thread_pool& pool) {
+  co_await pool.schedule();
+  co_return 42;
+}
+
+int main() {
+  xcoro::thread_pool pool(4);
+  return xcoro::sync_wait(compute(pool)) == 42 ? 0 : 1;
+}
+```
+
+你可以把它理解成：
+
+- `schedule()`：把当前协程投递到线程池执行
+- `yield()`：把当前协程重新排队，让别的任务先跑
+
+
+### 6. 使用 `io_context` 跑定时/网络协程
+
+`net::io_context` 不只是 I/O reactor，也负责定时器和协程恢复。  
+如果你要使用 `net` 模块，最重要的步骤是：
 
 1. 创建 `io_context`
-2. 调用 `run()` 启动事件循环线程（或 `run_in_current_thread()`）
-3. 提交 awaitable 任务（`sync_wait(...)` 或 `spawn(...)`）
-4. 调用 `stop()` 停止循环
+2. 调用 `run()` 或 `run_in_current_thread()`
+3. 在协程里使用 `sleep_for()` / `socket` / `acceptor` / `resolver`
+4. 结束前调用 `stop()`
 
-## Header Map
+下面是一个最小定时示例：
 
-常用头文件：
+```cpp
+#include <chrono>
+#include <cstdio>
+
+#include "xcoro/net/io_context.hpp"
+#include "xcoro/sync_wait.hpp"
+
+xcoro::task<void> say_later(xcoro::net::io_context& ctx) {
+  using namespace std::chrono_literals;
+  co_await ctx.sleep_for(50ms);
+  std::puts("tick");
+}
+
+int main() {
+  xcoro::net::io_context ctx;
+  ctx.run();
+  xcoro::sync_wait(say_later(ctx));
+  ctx.stop();
+}
+```
+
+## 常用头文件
+
+最常见的入口头文件如下：
 
 - `xcoro/task.hpp`
 - `xcoro/sync_wait.hpp`
@@ -177,7 +309,6 @@ int main() {
 - `xcoro/semaphore.hpp`
 - `xcoro/mutex.hpp`
 - `xcoro/condition_variable.hpp`
-- `xcoro/latch.hpp`
 - `xcoro/generator.hpp`
 - `xcoro/thread_pool.hpp`
 - `xcoro/net/io_context.hpp`
@@ -187,78 +318,3 @@ int main() {
 - `xcoro/net/endpoint.hpp`
 - `xcoro/net/buffer.hpp`
 
-## CMake Integration
-
-当前仓库尚未导出安装后的 CMake package/target，推荐先以源码方式引入：
-
-```cmake
-include(FetchContent)
-FetchContent_Declare(
-  xcoro
-  GIT_REPOSITORY https://github.com/<your-org>/xcoro.git
-  GIT_TAG main
-)
-FetchContent_MakeAvailable(xcoro)
-
-target_include_directories(your_target PRIVATE ${xcoro_SOURCE_DIR}/include)
-target_link_libraries(your_target PRIVATE Threads::Threads)
-```
-
-## Build And Test
-
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
-cmake --build build -j
-ctest --test-dir build --output-on-failure
-```
-
-当前测试覆盖包含：
-
-- `generator`
-- `cancellation`
-- `semaphore`
-- `mutex`
-- `condition_variable`
-- `latch`
-- `manual_reset_event`
-- `when_all`
-- `when_any`
-- `net::io_context/socket`
-
-## Important Notes
-
-### 1) 协程 Lambda 捕获生命周期
-
-请避免“带捕获的临时协程 lambda”直接调用，这会产生悬垂生命周期风险。  
-优先使用“无捕获协程 + 显式参数”。
-
-不推荐：
-
-```cpp
-tasks.push_back([&]() -> xcoro::task<int> {
-  co_await gate;
-  co_return 1;
-}()); // 捕获对象可能在挂起后已销毁
-```
-
-推荐：
-
-```cpp
-auto make_task = [](xcoro::manual_reset_event& ev) -> xcoro::task<int> {
-  co_await ev;
-  co_return 1;
-};
-tasks.push_back(make_task(gate));
-```
-
-### 2) API 稳定性
-
-该项目处于持续迭代阶段，接口命名与行为可能调整。  
-若用于生产，请固定 commit 并结合你的场景补充压力测试。
-
-## Roadmap
-
-- 导出正式 CMake target（`install()/find_package()`）
-- 增加跨平台 I/O 后端（当前网络模块偏 Linux）
-- 补充更多文档与示例（HTTP client/server、超时控制、背压策略）
-- 强化并发压力测试与 sanitizer 测试矩阵
