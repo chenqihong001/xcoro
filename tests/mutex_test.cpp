@@ -84,4 +84,3 @@ TEST(MutexTest, WaitingCoroutineResumedByCancellation) {
   EXPECT_TRUE(m.try_lock());
   m.unlock();
 }
-

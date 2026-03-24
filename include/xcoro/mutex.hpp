@@ -116,7 +116,7 @@ class mutex {
       auto state = std::make_shared<waiter_state>();
       state->handle = handle;
       if (!mutex_.enqueue_waiter(state)) {
-        return false;
+        return false;  // 不挂起，拿到锁，直接执行
       }
       state_ = state;
 
@@ -199,4 +199,3 @@ class mutex {
 };
 
 }  // namespace xcoro
-
